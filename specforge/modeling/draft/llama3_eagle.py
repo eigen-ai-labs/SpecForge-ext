@@ -1070,6 +1070,10 @@ class LlamaFlexAttention(LlamaAttention):
         - past_key_values: dynamic cache used for storing past key and value states.
     """
 
+    def __init__(self, config, layer_idx: int = 0):
+        super().__init__(config)
+        self.layer_idx = layer_idx
+
     def forward(
         self,
         hidden_states: torch.Tensor,
@@ -1127,7 +1131,7 @@ class LlamaFlexAttention(LlamaAttention):
         key_cache, value_cache = past_key_values.update(
             key_states,
             value_states,
-            layer_idx=0,  # TODO: support multiple layers
+            layer_idx=self.layer_idx,
             cache_kwargs=cache_kwargs,
         )
 
@@ -1234,9 +1238,10 @@ class LlamaRMSNorm(nn.Module):
 
 
 class LlamaDecoderLayer(nn.Module):
-    def __init__(self, config, attention_backend: str = "sdpa"):
+    def __init__(self, config, layer_idx: int = 0, attention_backend: str = "sdpa"):
         super().__init__()
         self.hidden_size = config.hidden_size
+        self.layer_idx = layer_idx
 
         if attention_backend == "sdpa":
             self.self_attn = LlamaAttention(config=config)
@@ -1244,7 +1249,7 @@ class LlamaDecoderLayer(nn.Module):
             self.self_attn = LlamaUSPAttention(config=config)
         elif attention_backend == "flex_attention":
             print_with_rank("Using flex attention on draft model training!")
-            self.self_attn = LlamaFlexAttention(config=config)
+            self.self_attn = LlamaFlexAttention(config=config, layer_idx=layer_idx)
         else:
             raise ValueError(f"Unknown attention backend {attention_backend}")
 
@@ -1322,13 +1327,18 @@ class LlamaForCausalLMEagle3(Eagle3DraftModel):
         super().__init__(config)
         self.config = config
         self.quant_config = quant_config
+        self.num_hidden_layers = config.num_hidden_layers
 
         self.vocab_size = config.vocab_size
         self.draft_vocab_size = config.draft_vocab_size
         self.embed_tokens = nn.Embedding(
             config.vocab_size, config.hidden_size, config.pad_token_id
         )
-        self.midlayer = LlamaDecoderLayer(config, attention_backend=attention_backend)
+        # Support multiple decoder layers based on config.num_hidden_layers
+        self.layers = nn.ModuleList([
+            LlamaDecoderLayer(config, layer_idx=i, attention_backend=attention_backend)
+            for i in range(config.num_hidden_layers)
+        ])
 
         if hasattr(config, "target_hidden_size"):
             self.fc = torch.nn.Linear(
@@ -1388,18 +1398,21 @@ class LlamaForCausalLMEagle3(Eagle3DraftModel):
             attention_mask, (batch_size, seq_length), hidden_states, 0
         )
 
-        # fc
+        # fc - project concatenated hidden states
         hidden_states = self.fc(hidden_states)
-        hidden_states = self.midlayer(
-            input_emb=inputs_embeds,
-            hidden_states=hidden_states,
-            cache_hidden=cache_hidden,
-            attention_mask=attention_mask,
-            position_ids=position_ids,
-            past_key_values=None,
-            output_attentions=False,
-            use_cache=False,
-        )
+
+        # iterate through all decoder layers
+        for layer in self.layers:
+            hidden_states = layer(
+                input_emb=inputs_embeds,
+                hidden_states=hidden_states,
+                cache_hidden=cache_hidden,
+                attention_mask=attention_mask,
+                position_ids=position_ids,
+                past_key_values=None,
+                output_attentions=False,
+                use_cache=False,
+            )
 
         # norm
         hidden_states = self.norm(hidden_states)
@@ -1428,13 +1441,16 @@ class LlamaForCausalLMEagle3(Eagle3DraftModel):
         past_key_values: Optional[Cache] = None,
         use_cache: bool = True,
     ) -> torch.Tensor:
-        return self.midlayer(
-            input_emb=input_embeds,
-            hidden_states=hidden_states,
-            cache_hidden=cache_hidden,
-            attention_mask=attention_mask,
-            position_ids=position_ids,
-            past_key_values=past_key_values,
-            output_attentions=False,
-            use_cache=False,
-        )
+        # Iterate through all decoder layers
+        for layer in self.layers:
+            hidden_states = layer(
+                input_emb=input_embeds,
+                hidden_states=hidden_states,
+                cache_hidden=cache_hidden,
+                attention_mask=attention_mask,
+                position_ids=position_ids,
+                past_key_values=past_key_values,
+                output_attentions=False,
+                use_cache=False,
+            )
+        return hidden_states

@@ -155,6 +155,12 @@ def parse_args() -> Tuple[ArgumentParser, Namespace]:
     )
     training_group.add_argument("--seed", type=int, default=0)
     training_group.add_argument("--draft-accumulation-steps", type=int, default=1)
+    training_group.add_argument(
+        "--loss-decay-factor",
+        type=float,
+        default=0.8,
+        help="Exponential decay factor for future step losses (0.8-0.95 recommended for longer predictions)",
+    )
 
     # data processing type
     optimization_group = parser.add_argument_group("optimization")
@@ -574,7 +580,9 @@ def run_forward(
 def run_backward_and_update(
     args: Namespace, plosses: List[torch.Tensor], optimizer: Optimizer, global_step: int
 ) -> None:
-    ploss_weight = [0.8**i for i in range(len(plosses))]
+    # Use configurable decay factor for loss weighting across prediction steps
+    decay_factor = getattr(args, "loss_decay_factor", 0.8)
+    ploss_weight = [decay_factor**i for i in range(len(plosses))]
     ploss = (
         sum([ploss_weight[i] * plosses[i] for i in range(len(plosses))])
         / args.draft_accumulation_steps
